@@ -18,13 +18,36 @@ A lua module for OpenResty, can dynamically update the upstreams from etcd.
 - logger: record the upstream response status and time cost in shared.dict.logger, and generate reports. OPTIONAL REQUIRE: syncer
 - health: read the logger data, set down peers that not work. Run health check
 
+### data structure of _M.data in syncer:
+```
+{
+    "my_test_service": {
+        "version": 16,
+        "peers": [
+            {"h":"10.1.1.1", "p": 8080, "w": 3, "s": 30, "c": "/health"},
+            {"h":"10.1.1.2", "p": 8080, "w": 4, "s": 30, "c": "/health"},
+            {"h":"10.1.1.3", "p": 8080, "w": 5, "s": 30, "c": "/health"},
+        ],
+    },
+    "_version": 16
+}
+```
+
 ## USAGE
+- tested under `etcd v3.2.5`
+- assume etcd is listenning at `192.168.0.46:2379`
 
 ### Prepare data in etcd:
+- start etcd:
 ```
-etcdctl set /v1/testing/services/my_test_service/10.1.1.1:8080 '{"weight": 3, "slow_start": 30, "checkurl": "/health"}'
-etcdctl set /v1/testing/services/my_test_service/10.1.1.2:8080 '{"weight": 4, "status": "down"}'
-etcdctl set /v1/testing/services/my_test_service/10.1.1.3:8080 '{"weight": 5}'
+etcd --debug --listen-client-urls 'http://192.168.0.46:2379' --advertise-client-urls 'http://192.168.0.46:2379'
+```
+
+- pretending service registration
+```
+ETCDCTL_API=2 etcdctl --endpoints=http://192.168.0.46:2379 set /v1/testing/services/my_test_service/10.1.1.3:8080 '{"weight": 3, "slow_start": 30, "checkurl": "/health"}'
+ETCDCTL_API=2 etcdctl --endpoints=http://192.168.0.46:2379 set /v1/testing/services/my_test_service/10.1.1.3:8080 '{"weight": 4, "status": "down"}'
+ETCDCTL_API=2 etcdctl --endpoints=http://192.168.0.46:2379 set /v1/testing/services/my_test_service/10.1.1.3:8080 '{"weight": 5}'
 
 The default weight is 1, if not set in ETCD, or json parse error and so on.
 ```
@@ -69,6 +92,16 @@ upstream test {
 }
 ```
 
+### entire configuration:
+- copy `lua-resty-http` lua files to `/usr/local/openresty/lualib/resty/`
+- copy `lua-resty-upstream-etcd` lua files to `/usr/local/openresty/lualib/resty/dyups/`
+
+```
+$ sudo cp conf.d/openresty.conf /etc/openresty/
+$ sudo mkdir -p /usr/local/openresty/app/upstream-etcd/
+$ sudo cp upstream-etcd/*.lua /usr/local/openresty/app/upstream-etcd/
+```
+
 ## Functions
 ### picker.rr(service_name)
 ### picker.show(service_name)
@@ -83,3 +116,4 @@ upstream test {
 ```
 I have not thought about it yet.
 ```
+

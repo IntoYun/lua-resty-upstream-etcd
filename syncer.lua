@@ -1,5 +1,5 @@
 local _M = {}
-local http = require "http"
+local http = require "resty.http"
 local json = require "cjson"
 
 local log = ngx.log
@@ -85,13 +85,13 @@ local function splitAddr(s)
 end
 
 local function getLock()
-    -- only the worker who get the lock can sync from etcd.
-    -- the lock keeps 150 seconds.
+    -- only the worker who get the 'lock' can sync from etcd.
     if _M.lock == true then
         return true
     end
 
-    local ok, err = _M.conf.storage:add("lock", true, 12)
+    -- for the first time, try to mark a 'lock' flag
+    local ok, err = _M.conf.storage:add("lock", true, 10)
     if not ok then
         if err == "exists" then
             return nil
@@ -99,16 +99,15 @@ local function getLock()
         errlog("GET LOCK: failed to add key \"lock\": " .. err)
         return nil
     end
+
+    -- we got the lock. mark it.
     _M.lock = true
     return true
 end
 
 local function refreshLock()
-    local ok, err = _M.conf.storage:set("lock", true, 25)
+    local ok, err = _M.conf.storage:set("lock", true, 10) -- set unconditionaly
     if not ok then
-        if err == "exists" then
-            return nil
-        end
         errlog("REFRESH LOCK: failed to set \"lock\"" .. err)
         return nil
     end
@@ -217,6 +216,9 @@ local function fetch(url)
 end
 
 local function watch(premature, index)
+    info("===> watch init index: ", index)
+    info("===> running_count: ", ngx.timer.running_count())
+    info("===> pending_count: ", ngx.timer.pending_count())
 
     local conf = _M.conf
     if premature or ngx_worker_exiting() then
@@ -225,6 +227,8 @@ local function watch(premature, index)
     end
 
     -- If we cannot acquire the lock, wait 1 second
+    -- for the lock to expire, which is setted by pre-worker who
+    -- may be killed by reload-signal
     if not getLock() then
         info("Waiting 1s for pre-worker to exit...")
         local ok, err = ngx_timer_at(1, watch, index)
@@ -234,6 +238,8 @@ local function watch(premature, index)
         return
     end
 
+    -- If got the lock, then keep refreshing it,
+    -- thus we can hold the lock all the time.
     refreshLock()
 
     local nextIndex
@@ -271,8 +277,8 @@ local function watch(premature, index)
                 goto continue
             end
 
-            if upstreamList.errorCode then
-                errlog("When fetch from etcd: " .. upstreamList.message)
+            if upstreamInfo.errorCode then
+                errlog("When fetch from etcd: " .. upstreamInfo.message)
                 ngx_sleep(1)
                 goto continue
             end
@@ -285,7 +291,6 @@ local function watch(premature, index)
                         if not err then
                             _M.data[name].peers[#_M.data[name].peers+1] = peer
                         end
-
                     end
                 end
                 -- Keep the version is the newest response x-etcd-index
@@ -302,6 +307,7 @@ local function watch(premature, index)
 
     -- Watch the change and update the data.
     else
+        info("===> now, watch for updates... ")
         local s_url = url .. "?wait=true&recursive=true&waitIndex=" .. index
         local change, err = fetch(s_url)
         if err == "timeout" then
@@ -374,6 +380,7 @@ local function watch(premature, index)
 
     ::continue::
     -- Start the update cycle.
+    info("===> start next watch with index: ", nextIndex)
     local ok, err = ngx_timer_at(0, watch, nextIndex)
     if not ok then
         errlog("Error start watch: ", err)
@@ -395,16 +402,9 @@ function _M.init(conf)
     local allname = dict:get("_allname")
     local version = dict:get("_version")
 
-    -- Not synced before, not reload but newly start
-    if not allname or not version then
-        local ok, err = ngx_timer_at(0, watch, nextIndex)
-        if not ok then
-            errlog("Error start watch: " .. err)
-        end
-        return
-
+    -- synced before, or restart after reload signal
     -- Load data from shm
-    else
+    if allname and version then
         _M.data = {}
         for name in allname:gmatch("[^|]+") do
             upst = dict:get(name .. "|peers")
@@ -433,7 +433,6 @@ function _M.init(conf)
     if not ok then
         errlog("Error start watch: " .. err)
     end
-
 end
 
 return _M
