@@ -1,15 +1,50 @@
 -- @author zhongjin
--- @date 20170817
+-- @date 2017-10-16
 
-local syncer = require "resty.dyups.syncer"
-local picker = require "resty.dyups.picker"
+_G.NULL = ngx.null
 
-local conf = {
-    etcd_host = "192.168.0.46",
-    etcd_port = 2379,
-    etcd_path = "/v1/testing/services/",
-    storage = ngx.shared["syncer"],
-}
+local __loaded_mods = {}
 
-syncer.init(conf)
-picker.init(conf.storage)
+-- as we could not use ngx.var.SERVER_DIR, so set it here.
+local __SERVER_DIR = "app/upstream-etcd"
+
+
+_G.saveMod = function(namespace, model)
+    package.loaded[table.concat({__SERVER_DIR, ".", namespace})] = model
+end
+
+
+--@param string: module name
+--@return table: module
+_G.loadMod = function(namespace)
+
+    -- try to find system module
+    local module = __loaded_mods[namespace]
+    if module then
+        return module
+    end
+
+    -- try to find project module
+    local proj_namespace = table.concat({__SERVER_DIR, ".", namespace})
+    local module = __loaded_mods[proj_namespace]
+    if module then
+        return module
+    end
+
+    -- try to load system module
+    local ok, module = pcall(require, namespace)
+    if ok then
+        __loaded_mods[namespace] = module
+        return module
+    end
+
+    -- try to load project module
+    local ok, module = pcall(require, proj_namespace)
+    if ok then
+        __loaded_mods[proj_namespace] = module
+        return module
+    end
+
+    ngx.log(ngx.ERR, "===> loadMod() failed to load module: ", namespace)
+    error("===> loadMod() failed to load module: "..namespace, 2)
+end

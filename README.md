@@ -21,21 +21,30 @@ A lua module for OpenResty, can dynamically update the upstreams from etcd.
 ### data structure of _M.data in syncer:
 ```
 {
-    "my_test_service": {
-        "version": 16,
-        "peers": [
-            {"h":"10.1.1.1", "p": 8080, "w": 3, "s": 30, "c": "/health"},
-            {"h":"10.1.1.2", "p": 8080, "w": 4, "s": 30, "c": "/health"},
-            {"h":"10.1.1.3", "p": 8080, "w": 5, "s": 30, "c": "/health"},
-        ],
-    },
-    "_version": 16
+  "recpKfkWorkers": {
+    "version": 1025,
+    "peers": [
+      {
+        "host": "10.161.133.29",
+        "weight": 1,
+        "start_at": 1530064475,
+        "params": [ ],
+        "status": "up",
+        "slow_start": 0,
+        "check_url": "\/",
+        "port": 10100
+      }
+    ]
+  },
+  "_version": 1025
 }
 ```
 
 ## USAGE
 - tested under `etcd v3.2.5`
 - assume etcd is listenning at `192.168.0.46:2379`
+- directory 'conf.d' and 'upstream-etcd' are used to build/test docker image
+- if build new docker image on top of it, you need to set 'init_worker_by_lua_file' in your openresty.conf
 
 ### Prepare data in etcd:
 - start etcd:

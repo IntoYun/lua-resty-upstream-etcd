@@ -14,7 +14,7 @@ local json = require "cjson"
 -- picker.init(conf.storage)
 
 
-local name = ngx.var.arg_svcname
+local name = ngx.var.arg_svcname or "recpKfkWorkers"
 local svc = picker.rr(name)
 local all = picker.show(name)
 
