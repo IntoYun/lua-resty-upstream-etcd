@@ -1,5 +1,5 @@
 local _M = {}
-local http = require "http"
+local http = require "resty.http"
 local json = require "cjson"
 
 local log = ngx.log
@@ -12,9 +12,17 @@ local ngx_timer_at = ngx.timer.at
 local ngx_worker_id = ngx.worker.id
 local ngx_worker_exiting = ngx.worker.exiting
 local ngx_sleep = ngx.sleep
+local ngx_encode_base64 = ngx.encode_base64
+local ngx_decode_base64 = ngx.decode_base64
 
-_M.ready = false
-_M.data = {}
+local Auth= nil
+local fFetch = false -- a full fetch from etcd
+local noAuth = 3
+local invalidAuth = 16
+local tFetch = 2 -- time to wait response from fetch()
+-- local tWatch = 3600
+local tWatch = 1200 -- time to wait response from watch()
+
 
 local function info(...)
     log(INFO, "syncer: ", ...)
@@ -49,11 +57,6 @@ local function indexOf(t, e)
     return nil
 end
 
-local function basename(s)
-    local x, y = s:match("(.*)/([^/]*)/?")
-    return y, x
-end
-
 local function splitAddr(s)
     if not s then
         return "127.0.0.1", 0, "nil args"
@@ -84,14 +87,21 @@ local function splitAddr(s)
     return host, port, nil
 end
 
+local function genPrefixBody()
+    local key = _M.conf.srv_prefix
+    local range_end = table.concat({key:sub(1, -2), string.char(key:byte(-1) + 1)})
+    return {key=ngx.encode_base64(key), range_end=ngx.encode_base64(range_end)}
+end
+
 local function getLock()
-    -- only the worker who get the lock can sync from etcd.
-    -- the lock keeps 150 seconds.
+    -- only the worker who get the 'lock' can sync from etcd.
+    info("===> getLock() _M.lock: ", _M.lock)
     if _M.lock == true then
         return true
     end
 
-    local ok, err = _M.conf.storage:add("lock", true, 12)
+    -- for the first time, try to mark a 'lock' flag
+    local ok, err = _M.conf.storage:add("lock", true, tFetch*2)
     if not ok then
         if err == "exists" then
             return nil
@@ -99,16 +109,15 @@ local function getLock()
         errlog("GET LOCK: failed to add key \"lock\": " .. err)
         return nil
     end
+
+    -- we got the lock. mark it.
     _M.lock = true
     return true
 end
 
 local function refreshLock()
-    local ok, err = _M.conf.storage:set("lock", true, 25)
+    local ok, err = _M.conf.storage:set("lock", true, tWatch+1) -- set unconditionaly
     if not ok then
-        if err == "exists" then
-            return nil
-        end
         errlog("REFRESH LOCK: failed to set \"lock\"" .. err)
         return nil
     end
@@ -122,23 +131,25 @@ local function releaseLock()
 end
 
 local function newPeer(key, value)
-    local name, ipport = key:match(_M.conf.etcd_path .. '([^/]+)/([^/]+)$')
+    info("===> newPeer() key: ", key)
+    info("===> newPeer() value: ", value)
+    local name, ipport = key:match('/([^/]+)/([^/]+)$')
+    info("===> newPeer() name: ", name)
+    info("===> newPeer() ipport: ", ipport)
     local h, p, err = splitAddr(ipport)
     if err then
         return {}, name, err
     end
 
-    local ok, cfg = pcall(json.decode, value)
+    local cfg = (not value) and {} or json.decode(value)
 
-    local w, s, c, t = 1, "up", "/", 0
-    if type(cfg) == "table" then
-        w = cfg.weight     or 1
-        s = cfg.status     or "up"
-        t = cfg.slow_start or 0
-
-        if cfg.check_url ~= "" then
-            c = cfg.check_url
-        end
+    local w, s, c, t, a = 1, "up", "/", 0, ngx.time()
+    if type(cfg.Metadata) == "table" then
+        w = cfg.Metadata.weight     or w
+        s = cfg.Metadata.status     or s
+        c = cfg.Metadata.check_url  or c
+        t = cfg.Metadata.slow_start or t
+        a = cfg.Metadata.start_at   or a
     end
 
     return { host   = h,
@@ -146,7 +157,9 @@ local function newPeer(key, value)
              weight = w,
              status = s,
              check_url  = c,
-             slow_start = t
+             slow_start = t,
+             start_at   = a,
+             params     = cfg.Params or {}
          }, name, nil
 end
 
@@ -192,193 +205,362 @@ local function save(name)
     return
 end
 
-local function fetch(url)
-    local client = http:new()
-    client:set_timeout(10000)
-    client:connect(_M.conf.etcd_host, _M.conf.etcd_port)
+local function updatePeer(data)
+    local events = data.result.events
+    for _,event in ipairs(events) do
+        local peer, name, err = newPeer(ngx_decode_base64(event.kv.key),
+            (event.kv.value and ngx_decode_base64(event.kv.value)))
+        if event.type and event.type == "DELETE" then
+            table.remove(_M.data[name].peers, indexOf(_M.data[name].peers, peer))
+            _M.data[name].version = event.kv.mod_revision
+            if 0 == #_M.data[name].peers then
+                _M.data[name] = nil
+            end
+            errlog("DELETE [".. name .. "]: " .. peer.host .. ":" .. peer.port)
+        else
+            if not _M.data[name] then
+                _M.data[name] = {version=tonumber(event.kv.mod_revision), peers={peer}}
+                errlog("CREATE [" .. name .. "]: " .. peer.host ..":".. peer.port)
+            else
+                local index = indexOf(_M.data[name].peers, peer)
+                if index == nil then
+                    errlog("ADD [" .. name .. "]: " .. peer.host ..":".. peer.port)
+                    peer.start_at = ngx_time()
+                    table.insert(_M.data[name].peers, peer)
+                else
+                    errlog("MODIFY [" .. name .. "]: " .. peer.host ..":".. peer.port)
+                    _M.data[name].peers[index] = peer
+                end
+                _M.data[name].version = tonumber(event.kv.mod_revision)
+            end
+        end
+        _M.data._version = tonumber(event.kv.mod_revision)
+        save(name)
+    end
+    info("===> _M.data: ", json.encode(_M.data))
+end
 
-    local res, err = client:request({path=url, method="GET"})
+local function auth()
+    if not _M.conf.username or not _M.conf.password then
+        return "missing username or password"
+    end
+
+    local client = http:new()
+    client:set_timeout(tFetch*1000)
+    local ok, err = client:connect(_M.conf.etcd_host, _M.conf.etcd_port)
+    info("===> auth() connect ok: ", ok)
+    info("===> auth() connect err: ", err)
+
+    local body = json.encode({name=_M.conf.username, password=_M.conf.password})
+    info("===> auth() body: ", body)
+    local res, err = client:request({
+        path="/v3alpha/auth/authenticate",
+        method="POST",
+        body=body,
+    })
+    info("===> auth() request err: ", err)
     if err then
+        return err
+    end
+
+    info("===> auth() type(res): ", type(res))
+    local body, err = res:read_body()
+    if err then
+        return err
+    end
+
+    local ok, data = pcall(json.decode, body)
+    if not ok then
+        return data
+    else
+        Auth = data.token
+    end
+
+    local ok, err = client:close()
+    if not ok then
+        return err
+    end
+end
+
+local function fetch(path, body)
+    info("===> fetch() start ")
+    info("===> fetch() running_count: ", ngx.timer.running_count())
+    info("===> fetch() pending_count: ", ngx.timer.pending_count())
+
+    local client = http:new()
+    client:set_timeout(tFetch*1000)
+    local ok, err = client:connect(_M.conf.etcd_host, _M.conf.etcd_port)
+    info("===> fetch() connect ok: ", ok)
+    info("===> fetch() connect err: ", err)
+    if err then
+        ngx_sleep(10)
+        return nil, err
+    end
+
+
+    local params = {path=path, method="POST"}
+    params.body  = json.encode(body)
+
+    ::again::
+    params.headers = {Authorization = Auth}
+    local res, err = client:request(params)
+    info("===> fetch() pramas: ", json.encode(params))
+    if err then
+        ngx_sleep(10)
         return nil, err
     end
 
     local body, err = res:read_body()
+    info("===> fetch() read_body: ", json.encode(body))
+    info("===> fetch() err: ", json.encode(err))
     if err then
         return nil, err
     end
 
     local ok, data = pcall(json.decode, body)
+    info("===> fetch() decode body ok: ", ok)
     if not ok then
         return nil, data
+    elseif (res.status == ngx.HTTP_BAD_REQUEST and data.code == noAuth) or
+        (res.status == ngx.HTTP_UNAUTHORIZED and data.code == invalidAuth) then
+        info("===> fetch() call auth ")
+        local err = auth()
+        if err then
+            return nil, err
+        end
+        info("===> fetch() goto again ")
+        goto again
     end
 
-    data.etcdIndex = res.headers["x-etcd-index"]
+    local ok, err = client:set_keepalive(2000, 1)
+    if not ok then
+        return nil, err
+    end
+
     return data, nil
 end
 
-local function watch(premature, index)
+local function watch()
+    info("===> watch() start... ")
+    info("===> watch() running_count: ", ngx.timer.running_count())
+    info("===> watch() pending_count: ", ngx.timer.pending_count())
 
-    local conf = _M.conf
+    local client = http:new()
+    client:set_timeout(tWatch*1000)
+    local ok, err = client:connect(_M.conf.etcd_host, _M.conf.etcd_port)
+    info("===> watch() connect ok: ", ok)
+    info("===> watch() connect err: ", err)
+    if err then
+        errlog("===> watch() connect err: ", err)
+        fFetch = true
+        ngx_sleep(10)
+        return
+    end
+
+    local params = {path="/v3alpha/watch", method="POST"}
+    params.body  = json.encode({create_request = genPrefixBody()})
+
+    local timeout = false
+
+    ::again::
+    if ngx_worker_exiting() then
+        info("===> watch() will exit ")
+        info("===> watch() worker_exiting_signal: ", ngx_worker_exiting())
+        -- we CAN'T release the lock here
+        -- releaseLock()
+        return
+    end
+
+    if timeout then
+        local ok, err = client:connect(_M.conf.etcd_host, _M.conf.etcd_port)
+        info("===> watch() connect ok: ", ok)
+        info("===> watch() connect err: ", err)
+        if err then
+            errlog("===> watch() connect err: ", err)
+            fFetch = true
+            ngx_sleep(10)
+            return
+        end
+    end
+    info("===> watch() timeout: ", timeout)
+
+    params.headers = {Authorization = Auth}
+    local res, err = client:request(params)
+    info("===> watch() pramas: ", json.encode(params))
+    if err then
+        errlog("===> watch() request err: ", err)
+        fFetch = true
+        ngx_sleep(10)
+        return
+    end
+
+    local reader = res.body_reader
+    repeat
+        -- If got the lock, then keep refreshing it,
+        -- thus we can hold the lock all the time.
+        info("===> watch() refreshLock for another ", tWatch+1)
+        refreshLock()
+
+        local chunk, err = reader()
+        if err then
+            if err == "timeout" then
+                timeout = true
+                goto again
+            else
+                errlog("read chunk error: "..err)
+                return
+            end
+        else
+            info("===> watch() chunk: ", chunk)
+            local ok, data = pcall(json.decode, chunk)
+            if not ok then
+                errlog("decode chunk error: "..err)
+                return
+            elseif data.error then
+                errlog("etcd-server error: "..chunk)
+                return
+            elseif data.result.canceled then
+                local reason = data.result.cancel_reason
+                local nAuth = reason:find("code = PermissionDenied")
+                info("===> watch() nAuth: ", nAuth)
+                if nAuth then
+                    info("===> watch() call auth ")
+                    local err = auth()
+                    if err then
+                        errlog("auth error: "..err)
+                        return
+                    else
+                        info("===> watch() goto again ")
+                        local ok, err = client:close()
+                        errlog("===> watch() set_keepalive ok: ", ok)
+                        errlog("===> watch() set_keepalive err: ", err)
+                        timeout = true
+                        goto again
+                    end
+                else
+                    errlog("watch error: "..reason)
+                    fFetch = true
+                    return
+                end
+            elseif data.result.events then
+                updatePeer(data)
+            end
+        end
+    until not chunk
+end
+
+local function cycle(premature)
+    info("===> cycle() start ")
+    info("===> cycle() running_count: ", ngx.timer.running_count())
+    info("===> cycle() pending_count: ", ngx.timer.pending_count())
+
     if premature or ngx_worker_exiting() then
+        info("===> cycle() will exit ")
+        info("===> cycle() premature: ", premature)
+        info("===> cycle() worker_exiting_signal: ", ngx_worker_exiting())
         releaseLock()
         return
     end
 
     -- If we cannot acquire the lock, wait 1 second
+    -- for the lock to expire, which is setted by pre-worker(
+    -- killed by reload-signal or light-thread start by last ngx.timer.at())
     if not getLock() then
-        info("Waiting 1s for pre-worker to exit...")
-        local ok, err = ngx_timer_at(1, watch, index)
+        info("===> cycle() miss the lock")
+        info("===> cycle() Waiting for pre-worker to exit...")
+        local ok, err = ngx_timer_at(2, cycle)
         if not ok then
-            errlog("Error start watch: ", err)
+            errlog("Error start cycle: ", err)
         end
         return
+    else
+        info("===> cycle() got the lock")
     end
 
-    refreshLock()
+    if not fFetch then
+        local dict = _M.conf.storage
+        local allname = dict:get("_allname")
+        local version = dict:get("_version")
 
-    local nextIndex
-    local url = "/v2/keys" .. conf.etcd_path
+        -- synced before, or restart after reload signal
+        -- Load data from shm
+        info("===> cycle() allname: ", allname)
+        info("===> cycle() version: ", version)
+        if allname and version then
+            info("===> cycle() sync from sharedDict...")
+
+            _M.data = {_version = version}
+            for name in allname:gmatch("[^|]+") do
+                upst = dict:get(name .. "|peers")
+                vers = dict:get(name .. "|version")
+
+                local ok, data = pcall(json.decode, upst)
+                if ok then
+                    _M.data[name] = {version = vers, peers = data}
+                else
+                    _M.data = nil
+                    break
+                end
+            end
+        end
+    end
 
     -- First time to fetch all the upstreams.
-    if index == nil then
-        local upstreamList, err = fetch(url .. "?recursive=true")
+    info("===> cycle() judge _M.data: ", _M.data and "exists" or "nil")
+    if not _M.data then
+        _M.data = {}
+        info("===> cycle() do full fetch first ")
+        local path = "/v3alpha/kv/range"
+        local body = genPrefixBody()
+        local upstreamList, err = fetch(path, body)
+
         if err then
             errlog("When fetch from etcd: " .. err)
             ngx_sleep(1)
             goto continue
         end
 
-        if upstreamList.errorCode then
-            errlog("When fetch from etcd: " .. upstreamList.message)
+        if upstreamList.code then
+            errlog("When fetch from etcd: " .. upstreamList.error)
             ngx_sleep(1)
             goto continue
         end
 
-        if not upstreamList.node.nodes then
-            warn("Empty dir: " .. upstreamList.message)
-            ngx_sleep(1)
-            goto continue
-        end
-
-        for n, s in pairs(upstreamList.node.nodes) do
-            local name = basename(s.key)
-            _M.data[name] = {version=tonumber(upstreamList.etcdIndex), peers={}}
-
-            local upstreamInfo, err = fetch(url .. name .. "?recursive=true")
-            if err then
-                errlog("When fetch from etcd: " .. err)
-                ngx_sleep(1)
-                goto continue
-            end
-
-            if upstreamList.errorCode then
-                errlog("When fetch from etcd: " .. upstreamList.message)
-                ngx_sleep(1)
-                goto continue
-            end
-
-            info("full fetching: " .. json.encode(upstreamInfo))
-            if upstreamInfo.node.dir then
-                if upstreamInfo.node.nodes then
-                    for i, j in pairs(upstreamInfo.node.nodes) do
-                        local peer, _, err = newPeer(j.key, j.value)
-                        if not err then
-                            _M.data[name].peers[#_M.data[name].peers+1] = peer
-                        end
-
+        if upstreamList.kvs then
+            local revision = tonumber(upstreamList.header.revision)
+            for _, s in pairs(upstreamList.kvs) do
+                local peer, name, err = newPeer(ngx_decode_base64(s.key), ngx_decode_base64(s.value))
+                info("===> cycle() name: ", name)
+                if not err then
+                    if not _M.data[name] then
+                        _M.data[name] = {version=revision, peers={}}
                     end
+                    table.insert(_M.data[name].peers, peer)
                 end
-                -- Keep the version is the newest response x-etcd-index
-                _M.data[name].version = tonumber(upstreamInfo.etcdIndex)
-                _M.data._version = _M.data[name].version
             end
-        end
+            _M.data._version = revision
 
-        if _M.data._version then
-            nextIndex = _M.data._version + 1
+            -- save upstreams and set 'ready' flag
+            save()
+            _M.conf.storage:set("ready", true)
         end
-        save()
-        _M.conf.storage:set("ready", true)
+        info("===> cycle() _M.data: ", json.encode(_M.data))
+        fFetch = false
+    end
 
     -- Watch the change and update the data.
-    else
-        local s_url = url .. "?wait=true&recursive=true&waitIndex=" .. index
-        local change, err = fetch(s_url)
-        if err == "timeout" then
-            nextIndex = _M.data._version + 1
-            ngx_sleep(1)
-            goto continue
-        elseif err ~= nil then
-            errlog("Error when watching etcd: ", err)
-            ngx_sleep(1)
-            goto continue
-        end
+    info("===> cycle() now, watch for updates... ")
+    watch() -- will spin until error
+    info("===> cycle() now, watch stop to spinning... ")
 
-        if change.errorCode == 401 then
-            nextIndex = nil
-            ngx_sleep(1)
-            goto continue
-        end
-
-        info("recv a change: " .. json.encode(change))
-
-        local action = change.action
-        if change.node.dir then
-            local name = change.node.key:match(_M.conf.etcd_path .. '([^/]+)$')
-            if name then
-                if action == "delete" then
-                    _M.data[name] = nil
-                elseif action == "set" or action == "update" or action == "compareAndSwap" then
-                    if not _M.data[name] then
-                        _M.data[name] = {version=tonumber(change.node.modifiedIndex), peers={}}
-                    end
-                end
-            end
-            _M.data._version = tonumber(change.node.modifiedIndex)
-            save(name)
-        else
-            local peer, name, err = newPeer(change.node.key, change.node.value)
-            if not err then
-                if action == "delete" or action == "expire" then
-                    table.remove(_M.data[name].peers, indexOf(_M.data[name].peers, peer))
-                    _M.data[name].version = change.node.modifiedIndex
-                    if 0 == #_M.data[name].peers then
-                        _M.data[name] = nil
-                    end
-                    errlog("DELETE [".. name .. "]: " .. peer.host .. ":" .. peer.port)
-                elseif action == "set" or action == "update" or action == "compareAndSwap" then
-                    if not _M.data[name] then
-                        _M.data[name] = {version=tonumber(change.node.modifiedIndex), peers={peer}}
-                        errlog("ADD [" .. name .. "]: " .. peer.host ..":".. peer.port)
-                    else
-                        local index = indexOf(_M.data[name].peers, peer)
-                        if index == nil then
-                            errlog("ADD [" .. name .. "]: " .. peer.host ..":".. peer.port)
-                            peer.start_at = ngx_time()
-                            table.insert(_M.data[name].peers, peer)
-                        else
-                            errlog("MODIFY [" .. name .. "]: " .. peer.host ..":".. peer.port .. " " .. change.node.value)
-                            _M.data[name].peers[index] = peer
-                        end
-                        _M.data[name].version = tonumber(change.node.modifiedIndex)
-                    end
-                end
-            else
-                errlog(err)
-            end
-            _M.data._version = tonumber(change.node.modifiedIndex)
-            save(name)
-        end
-        nextIndex = _M.data._version + 1
-    end
-
-    ::continue::
     -- Start the update cycle.
-    local ok, err = ngx_timer_at(0, watch, nextIndex)
+    ::continue::
+    info("===> cycle() start cycle in a new light-thread ")
+    _M.data = nil
+    local ok, err = ngx_timer_at(0, cycle)
     if not ok then
-        errlog("Error start watch: ", err)
+        errlog("Error start cycle: ", err)
     end
-    return
 end
 
 function _M.init(conf)
@@ -386,54 +568,15 @@ function _M.init(conf)
     if ngx_worker_id() ~= 0 then
         return
     end
+    info("===> init2() start ... ")
     _M.conf = conf
 
-    local nextIndex
-
-    local dict = _M.conf.storage
-
-    local allname = dict:get("_allname")
-    local version = dict:get("_version")
-
-    -- Not synced before, not reload but newly start
-    if not allname or not version then
-        local ok, err = ngx_timer_at(0, watch, nextIndex)
-        if not ok then
-            errlog("Error start watch: " .. err)
-        end
-        return
-
-    -- Load data from shm
-    else
-        _M.data = {}
-        for name in allname:gmatch("[^|]+") do
-            upst = dict:get(name .. "|peers")
-            vers = dict:get(name .. "|version")
-
-            local ok, data = pcall(json.decode, upst)
-
-            -- Any error occurs, goto full fetch
-            if not ok then
-                local ok, err = ngx_timer_at(0, watch, nextIndex)
-                if not ok then
-                    errlog("Error start watch: " .. err)
-                end
-                return
-            else
-                _M.data[name] = {version = vers, peers = data}
-            end
-        end
-
-        _M.data._version = version
-        nextIndex = _M.data._version + 1
-    end
-
-    -- Start the etcd watcher
-    local ok, err = ngx_timer_at(0, watch, nextIndex)
+    -- Start the etcd cycle
+    info("===> init() call ngx_timer_at() ...")
+    local ok, err = ngx_timer_at(0, cycle)
     if not ok then
         errlog("Error start watch: " .. err)
     end
-
 end
 
 return _M
